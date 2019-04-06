@@ -51,6 +51,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # seconds before now to read back from.
   config :start_position, :default => 'beginning'
 
+  # filters to search for and match terms, phrases, or values in your log events
+  config :filter_pattern, :validate => :string, :default => nil
 
   # def register
   public
@@ -188,8 +190,10 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
           :log_group_name => group,
           :start_time => @sincedb[group][:pos],
           :interleaved => true,
-          :next_token => next_token
-      }
+          :next_token => next_token,
+          :filter_pattern => @filter_pattern
+      }.compact
+
       resp = @cloudwatch.filter_log_events(params)
 
       resp.events.each do |event|
@@ -266,7 +270,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   private
   def serialize_sincedb
     @sincedb.map do |group, values|
-      @logger.info("Serializing group #{group}: position #{values[:pos]} event_ids count: #{values[:event_ids].length}")
+      @logger.info("Serializing group #{group}: position #{values[:pos]} event_ids count: #{values[:event_ids]&.length}")
       [group, values[:pos], values[:event_ids].to_a].flatten.join(" ")
     end.join("\n") + "\n"
   end

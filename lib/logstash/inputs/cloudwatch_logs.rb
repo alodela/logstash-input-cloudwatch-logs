@@ -228,7 +228,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       if @sincedb[group][:pos] == log.timestamp
         @sincedb[group][:event_ids] << log.event_id
       else
-        @sincedb[group] = { post: log.timestamp, event_ids: [] }
+        @sincedb[group] = { pos: log.timestamp, event_ids: [] }
       end
     end
   end # def process_log

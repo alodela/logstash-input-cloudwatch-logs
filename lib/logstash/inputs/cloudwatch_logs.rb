@@ -181,7 +181,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def process_group(group)
-    next_token = @sincedb[group]&.last_token
+    next_token = @sincedb[group]&[:last_token]
     loop do
       if !@sincedb.member?(group)
         @sincedb[group] = { pos: 0 }

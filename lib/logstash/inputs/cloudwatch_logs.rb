@@ -195,6 +195,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       }.compact
 
       resp = @cloudwatch.filter_log_events(params)
+      @logger.info("Received #{resp.events&.length} event from group #{group}, next token #{resp.next_token}")
 
       resp.events.each do |event|
         process_log(event, group)

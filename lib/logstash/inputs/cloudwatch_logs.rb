@@ -181,25 +181,36 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def process_group(group)
-    next_token = nil
+    next_token = @sincedb[group]&.last_token
     loop do
       if !@sincedb.member?(group)
         @sincedb[group] = { pos: 0 }
       end
+
       params = {
-          :log_group_name => group,
-          :start_time => @sincedb[group][:pos],
-          :interleaved => true,
-          :next_token => next_token,
-          :filter_pattern => @filter_pattern
-      }.compact
+        :log_group_name => group,
+        :interleaved => true,
+        :filter_pattern => @filter_pattern
+      }
+
+      if next_token
+        params[:next_token] = next_token
+      else
+        params[:start_time] = @sincedb[group][:pos]
+      end
 
       resp = @cloudwatch.filter_log_events(params)
-      @logger.info("Received #{resp.events&.length} event from group #{group}, next token #{resp.next_token}")
+      from = resp.events.first ? Time.at(resp.events.first.timestamp / 1000) : "n/a"
+      @logger.info("Received #{resp.events&.length} event from group #{group}, from: #{from}, next token #{resp.next_token}")
 
       resp.events.each do |event|
         process_log(event, group)
       end
+
+      if @sincedb[group][:last_token] != resp.next_token
+        @sincedb[group][:event_ids] = []
+      end
+      @sincedb[group][:last_token] = resp.next_token
 
       _sincedb_write
 
@@ -225,11 +236,14 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       decorate(event)
 
       @queue << event
-      if @sincedb[group][:pos] == log.timestamp
-        @sincedb[group][:event_ids] << log.event_id
-      else
-        @sincedb[group] = { pos: log.timestamp, event_ids: [] }
-      end
+      @sincedb[group][:event_ids] << log.event_id
+      @sincedb[group][:pos] = log.timestamp
+
+      # if @sincedb[group][:pos] == log.timestamp
+      #   @sincedb[group][:event_ids] << log.event_id
+      # else
+      #   @sincedb[group] = { pos: log.timestamp, event_ids: [] }
+      # end
     end
   end # def process_log
 
@@ -245,9 +259,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       File.open(@sincedb_path) do |db|
         @logger.debug? && @logger.debug("_sincedb_open: reading from #{@sincedb_path}")
         db.each do |line|
-          group, pos, event_ids = line.split(" ", 3)
+          group, pos, token, event_ids = line.split(" ", 4)
           @logger.debug? && @logger.debug("_sincedb_open: setting #{group} to #{pos.to_i}, event_ids: #{event_ids}")
-          @sincedb[group] = { pos: pos.to_i, event_ids: event_ids.split(" ").to_set }
+          @sincedb[group] = { pos: pos.to_i, last_token: token, event_ids: event_ids.split(" ").to_set }
         end
       end
     rescue
@@ -272,7 +286,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   def serialize_sincedb
     @sincedb.map do |group, values|
       @logger.info("Serializing group #{group}: position #{values[:pos]} event_ids count: #{values[:event_ids]&.length}")
-      [group, values[:pos], values[:event_ids].to_a].flatten.join(" ")
+      [group, values[:pos], values[:last_token], values[:event_ids].to_a].flatten.join(" ")
     end.join("\n") + "\n"
   end
 end # class LogStash::Inputs::CloudWatch_Logs

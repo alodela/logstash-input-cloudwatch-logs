@@ -54,6 +54,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # filters to search for and match terms, phrases, or values in your log events
   config :filter_pattern, :validate => :string, :default => nil
 
+  config :filter_buffer_time, validate: :number, default: 5 * 1000
+
   # def register
   public
   def register
@@ -167,13 +169,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       if !sincedb.member?(group)
         case @start_position
           when 'beginning'
-            sincedb[group] = { pos: 0 }
+            sincedb[group] = { start_time: 0 }
 
           when 'end'
-            sincedb[group] = { pos: DateTime.now.strftime('%Q') }
+            sincedb[group] = { start_time: DateTime.now.strftime('%Q') }
 
           else
-            sincedb[group] = { pos: DateTime.now.strftime('%Q').to_i - (@start_position * 1000) }
+            sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i - (@start_position * 1000) }
         end # case @start_position
       end
     end
@@ -181,23 +183,21 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def process_group(group)
-    next_token = @sincedb.dig(group, :last_token)
+    if !@sincedb.member?(group)
+      @sincedb[group] = { start_time: DateTime.now.strftime('%Q') }
+    end
+    end_time = DateTime.now.strftime('%Q').to_i
+    token = nil
+
     loop do
-      if !@sincedb.member?(group)
-        @sincedb[group] = { pos: 0 }
-      end
-
       params = {
-        :log_group_name => group,
-        :interleaved => true,
-        :filter_pattern => @filter_pattern
+        log_group_name: group,
+        start_time: @sincedb[group][:start_time] - @filter_buffer_time,
+        end_time: end_time,
+        interleaved: true,
+        token: token,
+        filter_pattern: @filter_pattern,
       }
-
-      if next_token
-        params[:next_token] = next_token
-      else
-        params[:start_time] = @sincedb[group][:pos]
-      end
 
       resp = @cloudwatch.filter_log_events(params)
       from = resp.events.first ? Time.at(resp.events.first.timestamp / 1000) : "n/a"
@@ -207,16 +207,27 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         process_log(event, group)
       end
 
-      if @sincedb[group][:last_token] != resp.next_token
-        @sincedb[group][:event_ids] = []
+      # if @sincedb[group][:next_token] != resp.next_token
+      #   @sincedb[group][:event_ids] = []
+      # end
+      # @sincedb[group][:next_token] = resp.next_token
+
+      token = resp.next_token
+      unless token
+        @sincedb[group] = {
+          prev_ids: @sincedb[group][:new_ids],
+          new_ids: Set[],
+          prev_end_time: end_time,
+          start_time: end_time,
+        }
+        break
       end
-      @sincedb[group][:last_token] = resp.next_token
 
-      _sincedb_write
-
-      next_token = resp.next_token
-      break if next_token.nil?
+      # break if next_token.nil?
     end
+
+    _sincedb_write
+
     @priority.delete(group)
     @priority << group
   end #def process_group
@@ -224,8 +235,15 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def process_log
   private
   def process_log(log, group)
+    prev_end_time = @sincedb[group][:prev_end_time]
+    prev_ids = @sincedb[group][:prev_ids]
+    end_time = @sincedb[group][:end_time]
+
     # Skip duplicate events
-    return if @sincedb[group][:pos] == log.timestamp && @sincedb[group][:event_ids].include?(log.event_id)
+    # return if @sincedb[group][:pos] == log.timestamp && @sincedb[group][:event_ids].include?(log.event_id)
+
+    return if prev_end_time && (log.ingestion_time <= prev_end_time || prev_ids.include?(log.event_id))
+    @sincedb[group][:new_ids] << log.event_id if end_time < log.ingestion_time
 
     @codec.decode(log.message.to_str) do |event|
       event.set("@timestamp", parse_time(log.timestamp))
@@ -236,8 +254,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       decorate(event)
 
       @queue << event
-      @sincedb[group][:event_ids] << log.event_id
-      @sincedb[group][:pos] = log.timestamp
+      # @sincedb[group][:event_ids] << log.event_id
+      # @sincedb[group][:pos] = log.timestamp
 
       # if @sincedb[group][:pos] == log.timestamp
       #   @sincedb[group][:event_ids] << log.event_id

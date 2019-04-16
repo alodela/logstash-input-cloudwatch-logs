@@ -8,6 +8,7 @@ require "stud/interval"
 require "aws-sdk"
 require "logstash/inputs/cloudwatch_logs/patch"
 require "fileutils"
+require "set"
 
 Aws.eager_autoload!
 
@@ -50,6 +51,11 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # seconds before now to read back from.
   config :start_position, :default => 'beginning'
 
+  # filters to search for and match terms, phrases, or values in your log events
+  config :filter_pattern, :validate => :string, :default => nil
+
+  # Buffer in seconds from the start time to search for delayed events in Cloudwatch
+  config :filter_buffer_time, validate: :number, default: 5 * 1000
 
   # def register
   public
@@ -164,13 +170,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       if !sincedb.member?(group)
         case @start_position
           when 'beginning'
-            sincedb[group] = 0
+            sincedb[group] = { start_time: 0 }
 
           when 'end'
-            sincedb[group] = DateTime.now.strftime('%Q')
+            sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i }
 
           else
-            sincedb[group] = DateTime.now.strftime('%Q').to_i - (@start_position * 1000)
+            sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i - (@start_position * 1000) }
         end # case @start_position
       end
     end
@@ -178,28 +184,41 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def process_group(group)
-    next_token = nil
-    loop do
-      if !@sincedb.member?(group)
-        @sincedb[group] = 0
-      end
-      params = {
-          :log_group_name => group,
-          :start_time => @sincedb[group],
-          :interleaved => true,
-          :next_token => next_token
-      }
-      resp = @cloudwatch.filter_log_events(params)
+    if !@sincedb.member?(group)
+      @sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i, prev_ids: Set[], new_ids: Set[] }
+    end
+    @sincedb[group][:end_time] = DateTime.now.strftime('%Q').to_i
+    @sincedb[group][:new_ids] ||= Set[]
+    @sincedb[group][:prev_ids] ||= Set[]
+    token = nil
 
+    loop do
+      params = {
+        log_group_name: group,
+        start_time: @sincedb[group][:start_time] - @filter_buffer_time,
+        end_time: @sincedb[group][:end_time],
+        interleaved: true,
+        next_token: token,
+        filter_pattern: @filter_pattern,
+      }
+
+      resp = @cloudwatch.filter_log_events(params)
       resp.events.each do |event|
         process_log(event, group)
       end
 
-      _sincedb_write
-
-      next_token = resp.next_token
-      break if next_token.nil?
+      token = resp.next_token
+      unless token
+        @sincedb[group] = {
+          start_time: @sincedb[group][:end_time],
+          prev_ids: @sincedb[group][:new_ids],
+        }
+        break
+      end
     end
+
+    _sincedb_write
+
     @priority.delete(group)
     @priority << group
   end #def process_group
@@ -207,6 +226,13 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def process_log
   private
   def process_log(log, group)
+    start_time = @sincedb[group][:start_time]
+    prev_ids = @sincedb[group][:prev_ids]
+    end_time = @sincedb[group][:end_time]
+
+    # Skips event ingested after start time to prevent duplicate event
+    return if log.ingestion_time <= start_time || prev_ids.include?(log.event_id)
+    @sincedb[group][:new_ids] << log.event_id if end_time < log.ingestion_time
 
     @codec.decode(log.message.to_str) do |event|
       event.set("@timestamp", parse_time(log.timestamp))
@@ -217,7 +243,6 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       decorate(event)
 
       @queue << event
-      @sincedb[group] = log.timestamp + 1
     end
   end # def process_log
 
@@ -233,9 +258,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       File.open(@sincedb_path) do |db|
         @logger.debug? && @logger.debug("_sincedb_open: reading from #{@sincedb_path}")
         db.each do |line|
-          group, pos = line.split(" ", 2)
-          @logger.debug? && @logger.debug("_sincedb_open: setting #{group} to #{pos.to_i}")
-          @sincedb[group] = pos.to_i
+          group, start_time, prev_ids = line.split(" ", 3)
+          @sincedb[group] = { start_time: start_time.to_i, prev_ids: prev_ids.to_s.split(" ").to_set }
         end
       end
     rescue
@@ -247,7 +271,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   private
   def _sincedb_write
     begin
-      IO.write(@sincedb_path, serialize_sincedb, 0)
+      IO.write(@sincedb_path, serialize_sincedb)
     rescue Errno::EACCES
       # probably no file handles free
       # maybe it will work next time
@@ -258,8 +282,8 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def serialize_sincedb
-    @sincedb.map do |group, pos|
-      [group, pos].join(" ")
+    @sincedb.map do |group, values|
+      [group, values[:start_time], values[:prev_ids].to_a].flatten.join(" ")
     end.join("\n") + "\n"
   end
 end # class LogStash::Inputs::CloudWatch_Logs

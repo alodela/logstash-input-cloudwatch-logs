@@ -54,6 +54,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # filters to search for and match terms, phrases, or values in your log events
   config :filter_pattern, :validate => :string, :default => nil
 
+  # Buffer in seconds from the start time to search for delayed events in Cloudwatch
   config :filter_buffer_time, validate: :number, default: 5 * 1000
 
   # def register
@@ -183,17 +184,14 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def process_group(group)
-    @logger.debug? && @logger.debug("enter process_group #{group}: #{@sincedb.member?(group)} - #{@sincedb[group]}")
     if !@sincedb.member?(group)
       @sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i, prev_ids: Set[], new_ids: Set[] }
     end
     @sincedb[group][:end_time] = DateTime.now.strftime('%Q').to_i
     @sincedb[group][:new_ids] ||= Set[]
     @sincedb[group][:prev_ids] ||= Set[]
-    # end_time = DateTime.now.strftime('%Q').to_i
     token = nil
 
-    @logger.debug? && @logger.debug("process_group #{group}: #{@sincedb[group]}")
     loop do
       params = {
         log_group_name: group,
@@ -205,29 +203,18 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       }
 
       resp = @cloudwatch.filter_log_events(params)
-      from = resp.events.first ? Time.at(resp.events.first.timestamp / 1000) : "n/a"
-      @logger.info("Received #{resp.events&.length} event from group #{group}, first event time: #{from}, has next token #{!resp.next_token.nil?}")
-
       resp.events.each do |event|
         process_log(event, group)
       end
-
-      # if @sincedb[group][:next_token] != resp.next_token
-      #   @sincedb[group][:event_ids] = []
-      # end
-      # @sincedb[group][:next_token] = resp.next_token
 
       token = resp.next_token
       unless token
         @sincedb[group] = {
           start_time: @sincedb[group][:end_time],
           prev_ids: @sincedb[group][:new_ids],
-          # prev_end_time: end_time,
         }
         break
       end
-
-      # break if next_token.nil?
     end
 
     _sincedb_write
@@ -239,15 +226,11 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   # def process_log
   private
   def process_log(log, group)
-    @logger.debug? && @logger.debug("process_log #{group}: #{@sincedb[group]}")
-    # prev_end_time = @sincedb[group][:prev_end_time]
     start_time = @sincedb[group][:start_time]
     prev_ids = @sincedb[group][:prev_ids]
     end_time = @sincedb[group][:end_time]
 
-    # Skip duplicate events
-    # return if @sincedb[group][:pos] == log.timestamp && @sincedb[group][:event_ids].include?(log.event_id)
-
+    # Skips event ingested after start time to prevent duplicate event
     return if log.ingestion_time <= start_time || prev_ids.include?(log.event_id)
     @sincedb[group][:new_ids] << log.event_id if end_time < log.ingestion_time
 
@@ -260,14 +243,6 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       decorate(event)
 
       @queue << event
-      # @sincedb[group][:event_ids] << log.event_id
-      # @sincedb[group][:pos] = log.timestamp
-
-      # if @sincedb[group][:pos] == log.timestamp
-      #   @sincedb[group][:event_ids] << log.event_id
-      # else
-      #   @sincedb[group] = { pos: log.timestamp, event_ids: [] }
-      # end
     end
   end # def process_log
 
@@ -285,7 +260,6 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         db.each do |line|
           group, start_time, prev_ids = line.split(" ", 3)
           @sincedb[group] = { start_time: start_time.to_i, prev_ids: prev_ids.to_s.split(" ").to_set }
-          @logger.debug? && @logger.debug("_sincedb_open: setting #{group} => #{@sincedb[group]}")
         end
       end
     rescue
@@ -297,9 +271,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   private
   def _sincedb_write
     begin
-      serialized = serialize_sincedb
-      @logger.debug? && @logger.debug("_sincedb_write serialized: #{serialized}")
-      IO.write(@sincedb_path, serialized)
+      IO.write(@sincedb_path, serialize_sincedb)
     rescue Errno::EACCES
       # probably no file handles free
       # maybe it will work next time
@@ -310,9 +282,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
 
   private
   def serialize_sincedb
-    @logger.debug? && @logger.debug("_sincedb_write started")
     @sincedb.map do |group, values|
-      @logger.debug? && @logger.debug("_sincedb_write: #{group}, #{values.to_s}")
       [group, values[:start_time], values[:prev_ids].to_a].flatten.join(" ")
     end.join("\n") + "\n"
   end

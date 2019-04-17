@@ -215,6 +215,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         }
         break
       end
+    rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+      # Wait 500ms and retry
+      sleep(500)
     end
 
     _sincedb_write

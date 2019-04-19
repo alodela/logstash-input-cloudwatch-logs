@@ -173,10 +173,10 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
             sincedb[group] = { start_time: 0 }
 
           when 'end'
-            sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i }
+            sincedb[group] = { start_time: DateTime.now.strftime('%s').to_i * 1000 }
 
           else
-            sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i - (@start_position * 1000) }
+            sincedb[group] = { start_time: (DateTime.now.strftime('%s').to_i * 1000) - (@start_position * 1000) }
         end # case @start_position
       end
     end
@@ -185,9 +185,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
   private
   def process_group(group)
     if !@sincedb.member?(group)
-      @sincedb[group] = { start_time: DateTime.now.strftime('%Q').to_i, prev_ids: Set[], new_ids: Set[] }
+      @sincedb[group] = { start_time: DateTime.now.strftime('%s').to_i * 1000, prev_ids: Set[], new_ids: Set[] }
     end
-    @sincedb[group][:end_time] = DateTime.now.strftime('%Q').to_i
+    @sincedb[group][:end_time] = DateTime.now.strftime('%s').to_i * 1000
     @sincedb[group][:new_ids] ||= Set[]
     @sincedb[group][:prev_ids] ||= Set[]
     token = nil
@@ -203,8 +203,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
       }
 
       resp = @cloudwatch.filter_log_events(params)
+      @logger.debug("CWL response contains #{resp.events.length} from #{parse_time(params[:start_time])} to #{parse_time(params[:end_time])}")
       resp.events.each do |event|
-        process_log(event, group)
+        processed = process_log(event, group)
       end
 
       token = resp.next_token
@@ -216,8 +217,9 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         break
       end
     rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+      @logger.info("reached rate limit - #{params[:start_time]} - #{params[:end_time]}")
       # Wait 500ms and retry
-      sleep(500)
+      Stud.stoppable_sleep(0.5) { stop? }
     end
 
     _sincedb_write
@@ -234,8 +236,12 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     end_time = @sincedb[group][:end_time]
 
     # Skips event ingested after start time to prevent duplicate event
-    return if log.ingestion_time <= start_time || prev_ids.include?(log.event_id)
-    @sincedb[group][:new_ids] << log.event_id if end_time < log.ingestion_time
+    return if log.ingestion_time < start_time || prev_ids.include?(log.event_id)
+
+    @sincedb[group][:new_ids] << log.event_id if log.ingestion_time > end_time
+    if Time.at(log.ingestion_time/1000) - Time.at(log.timestamp/1000) > 30
+      @logger.info("Event log delayed for more than 30 sec -- Delay #{Time.at(log.ingestion_time/1000) - Time.at(log.timestamp/1000)}")
+    end
 
     @codec.decode(log.message.to_str) do |event|
       event.set("@timestamp", parse_time(log.timestamp))

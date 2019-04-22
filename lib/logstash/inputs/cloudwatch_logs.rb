@@ -193,33 +193,35 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
     token = nil
 
     loop do
-      params = {
-        log_group_name: group,
-        start_time: @sincedb[group][:start_time] - @filter_buffer_time,
-        end_time: @sincedb[group][:end_time],
-        interleaved: true,
-        next_token: token,
-        filter_pattern: @filter_pattern,
-      }
-
-      resp = @cloudwatch.filter_log_events(params)
-      @logger.debug("CWL response contains #{resp.events.length} from #{parse_time(params[:start_time])} to #{parse_time(params[:end_time])}")
-      resp.events.each do |event|
-        processed = process_log(event, group)
-      end
-
-      token = resp.next_token
-      unless token
-        @sincedb[group] = {
-          start_time: @sincedb[group][:end_time],
-          prev_ids: @sincedb[group][:new_ids],
+      begin
+        params = {
+          log_group_name: group,
+          start_time: @sincedb[group][:start_time] - @filter_buffer_time,
+          end_time: @sincedb[group][:end_time],
+          interleaved: true,
+          next_token: token,
+          filter_pattern: @filter_pattern,
         }
-        break
+
+        resp = @cloudwatch.filter_log_events(params)
+        @logger.debug("CWL response contains #{resp.events.length} in #{group} from #{parse_time(params[:start_time])} to #{parse_time(params[:end_time])}")
+        resp.events.each do |event|
+          processed = process_log(event, group)
+        end
+
+        token = resp.next_token
+        unless token
+          @sincedb[group] = {
+            start_time: @sincedb[group][:end_time],
+            prev_ids: @sincedb[group][:new_ids],
+          }
+          break
+        end
+      rescue Aws::CloudWatchLogs::Errors::ThrottlingException
+        @logger.info("reached rate limit - #{params[:start_time]} - #{params[:end_time]}")
+        # Wait 500ms and retry
+        Stud.stoppable_sleep(0.5) { stop? }
       end
-    rescue Aws::CloudWatchLogs::Errors::ThrottlingException
-      @logger.info("reached rate limit - #{params[:start_time]} - #{params[:end_time]}")
-      # Wait 500ms and retry
-      Stud.stoppable_sleep(0.5) { stop? }
     end
 
     _sincedb_write
@@ -269,6 +271,7 @@ class LogStash::Inputs::CloudWatch_Logs < LogStash::Inputs::Base
         db.each do |line|
           group, start_time, prev_ids = line.split(" ", 3)
           @sincedb[group] = { start_time: start_time.to_i, prev_ids: prev_ids.to_s.split(" ").to_set }
+          @logger.info("Group log #{group} loaded from sincedb file. Start time: #{start_time} prev_ids: #{@sincedb[group][:prev_ids].length}")
         end
       end
     rescue
